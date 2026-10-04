@@ -38,6 +38,7 @@ for (const ref of refs) {
 
 // 内置示例必须能复核通过，并满足题设语义
 const { sampleBase64 } = await import('../public/sample.js');
+const { pixelTrajectory } = await import('../src/apng.js');
 const result = await reviewBase64(sampleBase64);
 if (result.numFrames < 3) fail(`内置示例至少需要 3 帧，实际 ${result.numFrames}`);
 if (result.frames[0].canvas.sha256 === result.frames[1].canvas.sha256) {
@@ -51,6 +52,35 @@ if (result.frames[2].canvas.sha256 !== result.frames[0].canvas.sha256) {
 } else {
   ok('previous 处置后第三帧画布恢复为首帧状态');
 }
+
+// 像素逐帧轨迹验收：帧2 子区域 5x5@(2,2)，取区域内坐标 (4,4)
+const trace = pixelTrajectory(result, 4, 4);
+if (trace.length !== result.numFrames) fail(`轨迹应覆盖全部 ${result.numFrames} 帧，实际 ${trace.length}`);
+if (trace[1].blended.join() === trace[1].before.join()) {
+  fail('轨迹第二帧混合后值必须不同于绘制前值（半透明 over 证据）');
+} else {
+  ok('轨迹显示第二帧 over 混合值不同于绘制前值');
+}
+if (trace[2].before.join() !== trace[0].blended.join()) {
+  fail('轨迹第三帧起始值必须恢复为 previous 前的背景');
+} else {
+  ok('轨迹显示第三帧起始值恢复为 previous 前的背景');
+}
+const outside = pixelTrajectory(result, 0, 0);
+if (outside[1].inRegion !== false || outside[1].sourcePixel !== null) {
+  fail('轨迹必须标记像素不在第二帧区域内的情况');
+} else {
+  ok('轨迹正确标记像素不在帧区域内的情况');
+}
+let threw = false;
+try { pixelTrajectory(result, result.width, 0); } catch { threw = true; }
+if (!threw) fail('坐标超出画布时 pixelTrajectory 必须拒绝生成轨迹');
+else ok('坐标超出画布时拒绝生成轨迹');
+
+// 前端必须接入轨迹功能
+const appSrc = readFileSync(join(ROOT, 'public/app.js'), 'utf8');
+if (!appSrc.includes('pixelTrajectory')) fail('public/app.js 未接入 pixelTrajectory 像素轨迹');
+else ok('前端已接入像素逐帧轨迹');
 
 if (failures > 0) {
   console.error(`构建检查共 ${failures} 项失败`);

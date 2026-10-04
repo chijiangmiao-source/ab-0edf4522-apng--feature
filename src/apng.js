@@ -569,6 +569,9 @@ export async function reviewApng(bytes) {
       canvas: canvasSummary,
       reconstructedPixels: pixels, // 该帧解滤波后的原始像素（帧区域尺寸，冻结）
       snapshot: displaySnapshot, // 合成画布冻结快照，外部只读
+      // 绘制前画布冻结拷贝。必须再切一份：previous 处置会让引擎内部
+      // canvas 直接复用 beforePaint 缓冲区，后续帧绘制会改写它。
+      beforePaint: beforePaint.slice(),
     });
   }
 
@@ -579,7 +582,53 @@ export async function reviewApng(bytes) {
     numFrames: struct.frames.length,
     numPlays: struct.numPlays,
     frames: framesOut,
+    finalCanvas: canvas.slice(), // 最后一帧处置完成后的画布状态（冻结拷贝）
   };
+}
+
+/* ----------------------------- 像素轨迹 ----------------------------- */
+
+// 追查某个画布坐标在每一帧的来源：绘制前画布值、该帧解滤波原像素、
+// 按 source / over 混合后的冻结画面值、none / background / previous 处置后的
+// 下一帧起始值；像素不在该帧 fcTL 区域内时明确标记。
+export function pixelTrajectory(result, x, y) {
+  if (!result || !Array.isArray(result.frames) || result.frames.length === 0) {
+    throw new APNGError('尚无有效复核结论，无法生成像素轨迹', 0);
+  }
+  const { width, height } = result;
+  if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x >= width || y >= height) {
+    throw new APNGError(
+      `坐标 (${x}, ${y}) 超出画布 ${width}×${height}（有效范围 X 0..${width - 1}，Y 0..${height - 1}）`,
+      0,
+    );
+  }
+  const pick = (buf) => {
+    const i = (y * width + x) * RGBA_BPP;
+    return [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+  };
+  return result.frames.map((f, i) => {
+    const c = f.control;
+    const inRegion =
+      x >= c.xOffset && x < c.xOffset + c.width && y >= c.yOffset && y < c.yOffset + c.height;
+    let sourcePixel = null;
+    if (inRegion) {
+      const si = ((y - c.yOffset) * c.width + (x - c.xOffset)) * RGBA_BPP;
+      const p = f.reconstructedPixels;
+      sourcePixel = [p[si], p[si + 1], p[si + 2], p[si + 3]];
+    }
+    // 处置后的下一帧起始 = 下一帧的绘制前快照；末帧则为全序列处置完成后的画布
+    const next = i + 1 < result.frames.length ? result.frames[i + 1].beforePaint : result.finalCanvas;
+    return {
+      frame: i + 1,
+      inRegion,
+      before: pick(f.beforePaint), // 绘制前画布 RGBA
+      sourcePixel, // 该帧解滤波原像素（不在区域内为 null）
+      blended: pick(f.snapshot), // 按 source / over 得到的冻结画面 RGBA
+      blendOp: c.blendOp,
+      disposeOp: c.disposeOp,
+      nextStart: pick(next), // 处置后下一帧起始 RGBA
+    };
+  });
 }
 
 export async function reviewBase64(text) {
