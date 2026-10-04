@@ -492,6 +492,10 @@ export async function reviewApng(bytes) {
   const framesOut = [];
   // 合成画布：起始为全透明
   let canvas = new Uint8Array(struct.width * struct.height * RGBA_BPP);
+  // 逐帧画布轨道（冻结独立拷贝）：track[0] 为首帧绘制前的全透明画布，
+  // track[i+1] 为第 i 帧处置后（即第 i+1 帧绘制前）的画布，末帧处置后为 track[numFrames]；
+  // 像素轨迹的“绘制前 / 处置恢复来源”只读取这些快照
+  const beforePaintTrack = [canvas.slice()];
 
   for (const frame of struct.frames) {
     // 1) 逐帧分别解压（绝不跨帧拼接 zlib 流）
@@ -546,6 +550,9 @@ export async function reviewApng(bytes) {
       canvas = beforePaint;
     }
 
+    // 处置后的画布即下一帧的绘制前状态（末帧为其处置后终态）
+    beforePaintTrack.push(canvas.slice());
+
     const delayDen = frame.delayDen === 0 ? 100 : frame.delayDen;
     framesOut.push({
       index: frame.index,
@@ -579,7 +586,70 @@ export async function reviewApng(bytes) {
     numFrames: struct.frames.length,
     numPlays: struct.numPlays,
     frames: framesOut,
+    // 每帧绘制前整画布轨道（冻结独立拷贝）：frames[i] 的绘制前状态为 track[i]，
+    // track[numFrames] 为最后一帧处置后的画布；像素轨迹只读取这些快照
+    beforePaintTrack,
   };
+}
+
+/* ----------------------------- 像素逐帧轨迹 ----------------------------- */
+
+const TRACE_DISPOSE_LABEL = ['none（画布保留）', 'background（帧区域恢复透明）', 'previous（恢复绘制前）'];
+
+// 追查画布坐标 (x,y) 在每一帧的来源轨迹：
+//  绘制前画布 RGBA → 该帧解滤波原像素（在区域内时）→ source/over 冻结画面 RGBA
+//  → none/background/previous 处置后的下一帧起始 RGBA；
+// 坐标越界返回 null（调用方不得据此生成/保留旧轨迹）。
+export function pixelTrace(result, x, y) {
+  if (!result || result.ok !== true) return null;
+  if (!Number.isInteger(x) || !Number.isInteger(y)) return null;
+  if (x < 0 || y < 0 || x >= result.width || y >= result.height) return null;
+
+  const track = result.beforePaintTrack;
+  const pick = (buf) => {
+    const i = (y * result.width + x) * RGBA_BPP;
+    return { r: buf[i], g: buf[i + 1], b: buf[i + 2], a: buf[i + 3] };
+  };
+  const same = (p, q) => p.r === q.r && p.g === q.g && p.b === q.b && p.a === q.a;
+
+  const entries = result.frames.map((f, i) => {
+    const c = f.control;
+    const inRegion =
+      x >= c.xOffset && x < c.xOffset + c.width && y >= c.yOffset && y < c.yOffset + c.height;
+    const before = pick(track[i]);
+    const frozen = pick(f.snapshot);
+    let sourcePixel = null;
+    if (inRegion) {
+      const lx = x - c.xOffset;
+      const ly = y - c.yOffset;
+      const si = (ly * c.width + lx) * RGBA_BPP;
+      const p = f.reconstructedPixels;
+      sourcePixel = { r: p[si], g: p[si + 1], b: p[si + 2], a: p[si + 3] };
+    }
+    return {
+      frame: i + 1,
+      sequenceNumber: f.sequenceNumber,
+      inRegion,
+      region: {
+        x: c.xOffset,
+        y: c.yOffset,
+        width: c.width,
+        height: c.height,
+      },
+      blendOp: c.blendOp,
+      blend: c.blend,
+      disposeOp: c.disposeOp,
+      dispose: TRACE_DISPOSE_LABEL[c.disposeOp],
+      beforePaint: before, // 绘制前画布 RGBA
+      sourcePixel, // 解滤波原像素 RGBA；不在帧区域时为 null
+      frozen, // source/over 之后冻结画面 RGBA
+      afterDispose: pick(track[i + 1]), // 处置后下一帧起始 RGBA
+      changed: !same(before, frozen), // 该帧是否改动此像素
+      restored: !same(frozen, pick(track[i + 1])), // 处置是否改回该像素
+    };
+  });
+
+  return { x, y, width: result.width, height: result.height, frames: entries };
 }
 
 export async function reviewBase64(text) {

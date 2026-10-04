@@ -6,7 +6,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { reviewBase64 } from '../src/apng.js';
+import { reviewBase64, pixelTrace } from '../src/apng.js';
 
 const ROOT = process.cwd();
 let failures = 0;
@@ -50,6 +50,46 @@ if (result.frames[2].canvas.sha256 !== result.frames[0].canvas.sha256) {
   fail('内置示例第三帧画布摘要必须与首帧一致（previous 恢复背景）');
 } else {
   ok('previous 处置后第三帧画布恢复为首帧状态');
+}
+
+// 像素逐帧轨迹证据：内置示例第二帧区域 (2,2) 5x5，取其中 (3,3)
+const trace = pixelTrace(result, 3, 3);
+if (!trace) fail('像素轨迹在合法坐标 (3,3) 上应返回结果');
+else {
+  const [, e2, e3] = trace.frames;
+  if (JSON.stringify(e2.frozen) === JSON.stringify(e2.beforePaint)) {
+    fail('轨迹证据：第二帧半透明 over 混合后 RGBA 必须不同于绘制前 RGBA');
+  } else {
+    ok('轨迹证据：第二帧混合后 RGBA 不同于绘制前 RGBA');
+  }
+  if (JSON.stringify(e3.beforePaint) !== JSON.stringify(trace.frames[0].frozen)) {
+    fail('轨迹证据：第三帧开始 RGBA 必须恢复为 previous 前的背景');
+  } else {
+    ok('轨迹证据：第三帧开始 RGBA 恢复为 previous 前背景');
+  }
+  if (e2.sourcePixel?.a !== 160) fail(`轨迹证据：第二帧解滤波原像素 alpha 应为 160，实际 ${e2.sourcePixel?.a}`);
+  else ok('轨迹证据：第二帧解滤波原像素 RGBA 可追溯');
+}
+if (pixelTrace(result, 0, 0).frames[1].inRegion !== false) {
+  fail('轨迹证据：(0,0) 不在第二帧区域内时必须明确标记');
+} else {
+  ok('轨迹证据：像素不在帧区域内时明确标记且无原像素');
+}
+if (pixelTrace(result, 8, 0) !== null || pixelTrace(result, 0, -1) !== null) {
+  fail('轨迹证据：坐标超出画布必须返回 null');
+} else {
+  ok('轨迹证据：越界坐标不产生轨迹');
+}
+
+// 前端必须接入轨迹能力与“随结论同步清除”路径
+const appJs = readFileSync(join(ROOT, 'public/app.js'), 'utf8');
+for (const [needle, label] of [
+  ['pixelTrace', 'app.js 引入 pixelTrace'],
+  ['traceCoord = null', '切换结论 / 切帧 / 清空时清除轨迹坐标'],
+  ['addEventListener(\'click\'', '合成画布支持点击选择像素'],
+]) {
+  if (!appJs.includes(needle)) fail(`前端缺少轨迹接入：${label}`);
+  else ok(label);
 }
 
 if (failures > 0) {

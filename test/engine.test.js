@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reviewApng, reviewBase64, APNGError, MAX_INPUT_BYTES } from '../src/apng.js';
+import { reviewApng, reviewBase64, APNGError, MAX_INPUT_BYTES, pixelTrace } from '../src/apng.js';
 import {
   SIGNATURE,
   ihdr,
@@ -503,4 +503,132 @@ test('delayDen=0 按 100 处理', async () => {
   const bytes = buildApng(1, 1, [{ delayNum: 5, delayDen: 0, painter: () => RED_128 }]);
   const r = await reviewApng(bytes);
   assert.ok(Math.abs(r.frames[0].control.delaySeconds - 0.05) < 1e-9);
+});
+
+/* ---------------------------- 像素逐帧轨迹 ---------------------------- */
+
+const asObj = (p) => (p ? { r: p[0], g: p[1], b: p[2], a: p[3] } : null);
+const snapPx = (f, x, y, w) => asObj(Array.from(f.snapshot.subarray((y * w + x) * 4, (y * w + x) * 4 + 4)));
+const reconPx = (f, lx, ly) => {
+  const i = (ly * f.control.width + lx) * 4;
+  return asObj(Array.from(f.reconstructedPixels.subarray(i, i + 4)));
+};
+
+test('像素轨迹：半透明 over 第二帧混合值不同于绘制前，previous 后第三帧起始恢复背景', async () => {
+  const bytes = buildApng(4, 4, [
+    { painter: () => RED_128, blend: 1, dispose: 0 },
+    { w: 2, h: 2, x: 1, y: 1, painter: () => GREEN_128, blend: 1, dispose: 2 },
+    { painter: () => TRANSPARENT, blend: 1, dispose: 0 },
+  ]);
+  const r = await reviewApng(bytes);
+  assert.equal(r.beforePaintTrack.length, r.numFrames + 1, '轨道应含 N+1 个快照（含末帧处置后）');
+
+  // 区域内像素 (2,2)：第一帧红 → 第二帧 over 绿 → previous → 第三帧回到红
+  const trace = pixelTrace(r, 2, 2);
+  assert.ok(trace, '合法坐标必须返回轨迹');
+  assert.equal(trace.x, 2);
+  assert.equal(trace.y, 2);
+  assert.equal(trace.frames.length, 3);
+
+  const [e1, e2, e3] = trace.frames;
+  assert.deepEqual(e1.beforePaint, { r: 0, g: 0, b: 0, a: 0 }, '首帧绘制前全透明');
+  assert.deepEqual(e1.sourcePixel, { r: 255, g: 0, b: 0, a: 128 });
+  assert.deepEqual(e1.frozen, snapPx(r.frames[0], 2, 2, 4));
+  assert.deepEqual(e1.afterDispose, e1.frozen, 'none 处置后下一帧起始=冻结值');
+
+  assert.equal(e2.inRegion, true);
+  assert.deepEqual(e2.sourcePixel, reconPx(r.frames[1], 1, 1), '原像素按帧区域局部坐标读取');
+  assert.notDeepEqual(e2.frozen, e2.beforePaint, '第二帧 over 混合后必须不同于绘制前值');
+  assert.deepEqual(e2.frozen, snapPx(r.frames[1], 2, 2, 4));
+  assert.equal(e2.changed, true);
+  assert.equal(e2.restored, true);
+  // previous 处置后的下一帧起始 = 第二帧绘制前（首帧红）
+  assert.deepEqual(e2.afterDispose, e2.beforePaint);
+
+  // 第三帧开始值恢复为 previous 前的背景（首帧冻结状态）
+  assert.deepEqual(e3.beforePaint, e2.beforePaint);
+  assert.deepEqual(e3.beforePaint, e1.frozen);
+  assert.deepEqual(e3.frozen, e3.beforePaint, '第三帧 over 全透明不改变像素');
+});
+
+test('像素轨迹：子区域外像素标记 inRegion=false、无原像素，冻结值沿用绘制前', async () => {
+  const bytes = buildApng(4, 4, [
+    { painter: () => RED_128, blend: 1, dispose: 0 },
+    { w: 2, h: 2, x: 1, y: 1, painter: () => GREEN_128, blend: 1, dispose: 2 },
+    { painter: () => TRANSPARENT, blend: 1, dispose: 0 },
+  ]);
+  const r = await reviewApng(bytes);
+  const trace = pixelTrace(r, 0, 0); // 第二帧区域 (1,1) 2x2 之外
+  const [e1, e2, e3] = trace.frames;
+  assert.equal(e1.inRegion, true);
+  assert.equal(e2.inRegion, false);
+  assert.equal(e2.sourcePixel, null, '区域外不得给出解滤波原像素');
+  assert.deepEqual(e2.frozen, e2.beforePaint, '区域外冻结值=绘制前值');
+  assert.equal(e2.changed, false);
+  assert.equal(e3.inRegion, true);
+  assert.deepEqual(e3.sourcePixel, { r: 0, g: 0, b: 0, a: 0 });
+});
+
+test('像素轨迹：background 处置后下一帧起始在帧区域恢复全透明，区域外不受影响', async () => {
+  const bytes = buildApng(4, 4, [
+    { painter: (x, y) => (x < 2 && y < 2 ? RED_128 : TRANSPARENT), blend: 0, dispose: 1 },
+    { painter: () => TRANSPARENT, blend: 1, dispose: 0 },
+  ]);
+  const r = await reviewApng(bytes);
+  const inside = pixelTrace(r, 1, 1).frames[0];
+  assert.deepEqual(inside.frozen, { r: 255, g: 0, b: 0, a: 128 });
+  assert.deepEqual(inside.afterDispose, { r: 0, g: 0, b: 0, a: 0 }, 'background：区域内恢复透明');
+  const outside = pixelTrace(r, 3, 3).frames[0];
+  assert.deepEqual(outside.beforePaint, { r: 0, g: 0, b: 0, a: 0 });
+  assert.deepEqual(outside.afterDispose, { r: 0, g: 0, b: 0, a: 0 }, '区域外本来就透明');
+});
+
+test('像素轨迹：source 覆盖帧冻结值等于原像素；末帧处置后仍给出终态', async () => {
+  const bytes = buildApng(2, 2, [
+    { painter: () => RED_128, blend: 1, dispose: 0 },
+    { painter: () => BLUE_128, blend: 0, dispose: 1 },
+  ]);
+  const r = await reviewApng(bytes);
+  const e2 = pixelTrace(r, 0, 0).frames[1];
+  assert.deepEqual(e2.frozen, { r: 0, g: 0, b: 255, a: 128 }, 'source 连同 alpha 直接覆盖');
+  assert.deepEqual(e2.frozen, e2.sourcePixel);
+  assert.deepEqual(e2.afterDispose, { r: 0, g: 0, b: 0, a: 0 }, '末帧 background 终态透明');
+});
+
+test('像素轨迹：坐标越界 / 非法 / 无结论一律返回 null', async () => {
+  const bytes = buildApng(2, 2, [{ painter: () => RED_128 }]);
+  const r = await reviewApng(bytes);
+  assert.equal(pixelTrace(r, -1, 0), null);
+  assert.equal(pixelTrace(r, 0, 2), null);
+  assert.equal(pixelTrace(r, 2, 0), null);
+  assert.equal(pixelTrace(r, 1.5, 0), null);
+  assert.equal(pixelTrace(r, '0', '0'), null);
+  assert.equal(pixelTrace(r, NaN, 0), null);
+  assert.equal(pixelTrace(null, 0, 0), null);
+  assert.equal(pixelTrace({ ok: false }, 0, 0), null);
+});
+
+test('像素轨迹：只读取冻结快照，外部篡改返回结果不影响轨道', async () => {
+  const bytes = buildApng(2, 2, [
+    { painter: () => RED_128, dispose: 0 },
+    { painter: () => GREEN_128, dispose: 2 },
+    { painter: () => TRANSPARENT },
+  ]);
+  const r = await reviewApng(bytes);
+  r.frames[1].snapshot.fill(99);
+  const t = pixelTrace(r, 0, 0);
+  assert.deepEqual(t.frames[1].beforePaint, { r: 255, g: 0, b: 0, a: 128 });
+  assert.deepEqual(t.frames[2].beforePaint, { r: 255, g: 0, b: 0, a: 128 }, 'previous 恢复来源不受外部改写影响');
+});
+
+test('内置示例轨迹：第二帧混合值不同、第三帧起始恢复 previous 前背景', async () => {
+  const { sampleBase64 } = await import('../public/sample.js');
+  const r = await reviewBase64(sampleBase64);
+  // 第二帧区域 (2,2) 5x5 内取 (3,3)
+  const t = pixelTrace(r, 3, 3);
+  assert.notDeepEqual(t.frames[1].frozen, t.frames[1].beforePaint, '第二帧 over 后必须不同于绘制前');
+  assert.deepEqual(t.frames[2].beforePaint, t.frames[0].frozen, '第三帧开始值恢复为 previous 前背景');
+  assert.equal(t.frames[1].inRegion, true);
+  // 区域外像素 (0,0) 在第二帧标记为不在区域
+  assert.equal(pixelTrace(r, 0, 0).frames[1].inRegion, false);
 });
